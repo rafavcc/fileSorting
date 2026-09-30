@@ -1,0 +1,12 @@
+# Local reports and logs
+*_report.tsv
+h264_by_bitrate.tsv
+*.log
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local data and editor settings
+pornstars.txt
+.vscode/

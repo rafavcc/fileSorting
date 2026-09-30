@@ -1,0 +1,69 @@
+import os
+import shutil
+
+# Define the directory where the files are located
+down_path = "/Users/rafaelviegas/Downloads"
+listOfPeople = "ListOfPeopole"
+
+# Define a list of common persons names and close the file
+person_names = []
+file = open(listOfPeople)
+for linha in file:
+    person_names.append(linha.strip().title())
+    #print(f'person = {linha.strip().title()}')
+file.close()
+
+os.remove(os.path.join(os.getcwd(),listOfPeople))
+person_names.sort()
+file = open(listOfPeople, 'w')
+for linha in person_names:
+    file.write(linha + "\n")
+file.close()
+
+del linha
+del listOfPeople
+
+# Detect if there is a file to be moved and move it 
+def fileSorting(person_names, search_path, docu_path, filename):    
+     
+    # Extract the name of the file (without the extension) and remove . _ - 
+    name, ext = os.path.splitext(filename)
+    broken = name.replace(".", " ").replace("_", " ").replace("-", " ").replace("+", " ")
+    
+    # Loop through all person names
+    if (ext == ".mp4" or ext == ".avi" or ext == ".mkv" or ext == ".icloud"):
+        for person_name in person_names:
+            
+            # If the person name is found in the file name (ignoring case)
+            if person_name.lower() in broken.lower():     
+                
+                #Check if file is already in correct folder
+                check = docu_path.split("/")[-1]
+                if (check == person_name):
+                      break
+                  
+                # Create a directory for the person (if it doesn't exist)         
+                person_dir = os.path.join(docu_path, person_name)                      
+                if not os.path.exists(person_dir):
+                    os.mkdir(person_dir)
+                    
+                # Move the file to the person's directory
+                shutil.move(os.path.join(search_path, filename), os.path.join(person_dir, filename))
+                
+                # Break out of the loop (assuming each file only matches one person name)
+                break
+
+# Loop through all files in the directory
+def browsing(search_path, docu_path, person_names):
+    for filename in os.listdir(search_path):   
+        # Check if the file is a valid file (not a directory)
+        if os.path.isfile(os.path.join(search_path, filename)):
+            # If file, then sort file
+            fileSorting(person_names, search_path, docu_path, filename)  
+        else:
+            # If folder, then run recursevely run browsing again on sub-folder
+            search_path_sub = search_path + '/' + filename
+            browsing(search_path_sub, docu_path, person_names)
+
+# Run Script in Downloads Folder            
+browsing(down_path, docu_path, person_names)
