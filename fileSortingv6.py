@@ -1,144 +1,159 @@
 import argparse
-import os
-import shutil
 import logging
-from pathlib import Path
+import os
 import re
+import shutil
+from pathlib import Path
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(levelname)s: %(message)s',
     handlers=[logging.StreamHandler()]
 )
 
-def load_and_prepare_names(filepath: str, pmv: str) -> list[str]:
-    """Read names, clean them, sort, ensure pmv is first, and save back."""
-    path = Path(filepath)
+NAMES_FILE = Path(__file__).resolve().parent / "pornstars.txt"
+PMV = "Pmv Compilation"  # always checked first
+VALID_EXTS = {'.mp4', '.avi', '.mkv', '.icloud', '.wmv', '.m4v', '.mov', '.webm'}
+
+
+def normalize(text: str) -> str:
+    """Lowercase, turn every run of non-alphanumerics (. - _ + , & ( ) ...) into one space."""
+    return ' '.join(re.sub(r'[\W_]+', ' ', text.lower()).split())
+
+
+def load_and_prepare_names(path: Path, pmv: str, write: bool = True) -> list[str]:
+    """Read names, title-case, de-duplicate, sort with pmv first; rewrite the file only if that changed it."""
     if not path.exists():
-        raise FileNotFoundError(f"Names file not found: {filepath}")
+        raise FileNotFoundError(f"Names file not found: {path}")
 
-    names = []
-    with path.open('r', encoding='utf-8') as f:
-        for line in f:
-            cleaned = line.strip().title()
-            if cleaned:  # Skip empty lines
-                names.append(cleaned)
-
-    names.sort()
-    names = [n for n in names if n != pmv]
+    original = path.read_text(encoding='utf-8')
+    names = sorted({line.strip().title() for line in original.splitlines() if line.strip()} - {pmv})
     names.insert(0, pmv)
 
-    # Safely overwrite the file
-    with path.open('w', encoding='utf-8') as f:
-        f.write('\n'.join(names) + '\n')
-
+    cleaned = '\n'.join(names) + '\n'
+    if write and cleaned != original:
+        path.write_text(cleaned, encoding='utf-8')
+        logging.info(f"Cleaned up {path.name} ({len(names)} names).")
     return names
 
-def file_sorting(person_names: list[str], src_path: Path, dst_path: Path, filename: Path) -> bool:
-    """Sort a single file into a person's directory. Returns True if moved."""
-    ext = filename.suffix.lower()
-    valid_exts = {'.mp4', '.avi', '.mkv', '.icloud', '.wmv' ,'.m4v'}
-    if ext not in valid_exts:
+
+def build_matchers(person_names: list[str]) -> list[tuple[str, re.Pattern]]:
+    """One whole-word pattern per name, in priority order (pmv first, then alphabetical).
+    Whole-word means 'Ai' no longer matches inside 'maid' or 'Kincaid'."""
+    return [(name, re.compile(rf'(?<!\w){re.escape(normalize(name))}(?!\w)'))
+            for name in person_names if normalize(name)]
+
+
+def match_person(matchers: list[tuple[str, re.Pattern]], filename: Path) -> str | None:
+    text = normalize(filename.stem)
+    return next((name for name, pattern in matchers if pattern.search(text)), None)
+
+
+def move_into_place(src: Path, dest: Path):
+    """Move src to dest, replacing dest in a single step so a failure never loses both files."""
+    try:
+        os.replace(src, dest)
+    except OSError:  # different drive: copy next to dest first, then swap
+        tmp = dest.with_name(f".{dest.name}.partial")
+        shutil.move(src, tmp)
+        os.replace(tmp, dest)
+
+
+def file_sorting(matchers: list[tuple[str, re.Pattern]], dst_path: Path, filename: Path, dry_run: bool = False) -> bool:
+    """Sort a single file into a person's directory. Returns True if it was moved or removed as a duplicate."""
+    if filename.name.startswith('._') or filename.suffix.lower() not in VALID_EXTS:
+        return False  # macOS metadata stubs (._name.mp4) or non-video files
+
+    person = match_person(matchers, filename)
+    if person is None:
         return False
 
-    # Simplify filename stem for matching
-    name_part = filename.stem
-    simplified = re.sub(r'[.\-_+]', ' ', name_part).lower()
+    person_dir = dst_path / person
+    dest = person_dir / filename.name
+    src = filename
 
-    for person in person_names:
-        if person.lower() in simplified:
-            person_dir = dst_path / person
+    if dest.exists():
+        src_size, dest_size = src.stat().st_size, dest.stat().st_size
+        if src_size > dest_size:
+            action = f"Replaced {person}/{dest.name} with larger file ({src_size} > {dest_size} bytes)."
+            if not dry_run:
+                move_into_place(src, dest)
+        else:
+            kind = "smaller" if src_size < dest_size else "equal-size"
+            action = f"Deleted {kind} duplicate {src.name} (kept {person}/{dest.name})."
+            if not dry_run:
+                src.unlink()
+    else:
+        action = f"Moved {filename.name} → {person}/"
+        if not dry_run:
             person_dir.mkdir(parents=True, exist_ok=True)
-
-            dest = person_dir / filename.name
-            src = filename  # filename is already the full path
-
-            if dest.exists():
-                src_size = src.stat().st_size
-                dest_size = dest.stat().st_size
-
-                if src_size > dest_size:
-                    dest.unlink()
-                    shutil.move(src, dest)
-                    logging.info(f"Replaced {dest.name} with larger file ({src_size} bytes).")
-                elif src_size < dest_size:
-                    src.unlink()
-                    logging.info(f"Deleted smaller duplicate {src.name} ({src_size} bytes).")
-                else:
-                    src.unlink()
-                    logging.info(f"Deleted duplicate {src.name} with equal size.")
-                return True
-
             shutil.move(src, dest)
-            logging.info(f"Moved {filename.name} → {person}/")
-            return True  # Successfully moved
-    return False
 
-def process_directory(src_path: Path, dst_path: Path, person_names: list[str]):
-    """Walk source directory and sort files."""
-    logging.info(f"\n{'='*60}")
-    logging.info(f"Scanning source directory: {src_path}")
-    logging.info(f"{'='*60}")
+    logging.info(("[dry run] " if dry_run else "") + action)
+    return True
 
-    file_count = 0
-    for root, _, files in os.walk(src_path):
-        for filename in files:
-            file_count += 1
-            file_path = Path(root) / filename
-            logging.info(f"Processing: {file_path}")
-            file_sorting(person_names, Path(root), dst_path, file_path)
 
-    logging.info(f"\nTotal files scanned: {file_count}")
-    logging.info(f"{'='*60}\n")
+def process_directory(src_path: Path, dst_path: Path, person_names: list[str], dry_run: bool = False):
+    """Walk source directory and sort files; one bad file doesn't stop the rest."""
+    logging.info(f"Scanning {src_path} → {dst_path}")
+    matchers = build_matchers(person_names)
+    scanned = sorted_count = errors = 0
+    unmatched = []
+
+    for root, dirs, files in os.walk(src_path):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for name in files:
+            file_path = Path(root) / name
+            scanned += 1
+            try:
+                if file_sorting(matchers, dst_path, file_path, dry_run):
+                    sorted_count += 1
+                elif file_path.suffix.lower() in VALID_EXTS and not name.startswith('._'):
+                    unmatched.append(name)
+            except Exception as e:
+                errors += 1
+                logging.error(f"{name}: {e}")
+
+    for name in unmatched:
+        logging.info(f"No name match, left in place: {name}")
+    logging.info(f"Scanned {scanned} files: sorted={sorted_count} unmatched={len(unmatched)} errors={errors}")
+
 
 def get_default_paths() -> tuple[Path, Path]:
     """Return default source and destination paths for the current platform."""
     if os.name == 'nt':
-        return Path(r"E:\7_XYZ\_TO_BE_CAT"), Path(r"E:\7_XYZ")
+        return Path(r"D:\7_XYZ\_TO_BE_CAT"), Path(r"D:\7_XYZ")
+    return Path("/mnt/d/7_XYZ/_TO_BE_CAT"), Path("/mnt/d/7_XYZ")
 
-    return Path("/mnt/e/7_XYZ/_TO_BE_CAT"), Path("/mnt/e/7_XYZ")
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '-usedefaults',
-        '--usedefaults',
-        action='store_true',
-        help='Use the platform-specific default paths without prompting.'
-    )
+    parser.add_argument('-usedefaults', '--usedefaults', action='store_true',
+                        help='Use the platform-specific default paths without prompting.')
+    parser.add_argument('--src', type=Path, help='Folder to sort (no prompt).')
+    parser.add_argument('--dst', type=Path, help='Folder holding the person folders (no prompt).')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would happen without moving anything.')
     args = parser.parse_args(argv)
 
     default_src, default_dst = get_default_paths()
-
-    names_file = Path("/mnt/c/Users/rafavcc/iCloudDrive/Programming/projects/fileSorting") / "pornstars.txt"
-    pmv = "Pmv Compilation"
-
-    if args.usedefaults:
-        src_path = default_src
-        dst_path = default_dst
+    if args.usedefaults or args.src or args.dst:
+        src_path = args.src or default_src
+        dst_path = args.dst or default_dst
     else:
         src_input = input(f"Enter source directory (default: {default_src}): ").strip()
         src_path = Path(src_input) if src_input else default_src
-
         dst_input = input(f"Enter destination directory (default: {default_dst}): ").strip()
         dst_path = Path(dst_input) if dst_input else default_dst
 
-    if not src_path.exists():
-        logging.error(f"Source path does not exist: {src_path}")
-        return
-    if not dst_path.exists():
-        logging.error(f"Destination path does not exist: {dst_path}")
-        return
-    if not names_file.exists():
-        logging.error(f"Names file not found: {names_file}")
-        return
+    for label, path in (("Source", src_path), ("Destination", dst_path), ("Names file", NAMES_FILE)):
+        if not path.exists():
+            logging.error(f"{label} does not exist: {path}")
+            return 1
 
-    try:
-        person_names = load_and_prepare_names(names_file, pmv)
-        process_directory(src_path, dst_path, person_names)
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
+    person_names = load_and_prepare_names(NAMES_FILE, PMV, write=not args.dry_run)
+    process_directory(src_path, dst_path, person_names, args.dry_run)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
